@@ -10,8 +10,9 @@
  * to a HIGH-resolution gpu_ray raster cloud (rendered in one GPU pass) and each
  * frame select only the cells hit by the next batch of mid360.csv ray
  * directions. Different batch each frame -> the real non-repetitive petal
- * coverage, at GPU speed. A fine raster (e.g. 720x128) keeps the snap error
- * below the sensor's real angular resolution, so it does NOT look like stripes.
+ * coverage, at GPU speed. Each point is emitted along its exact CSV direction
+ * with the range interpolated from the surrounding raster cells; emitting the
+ * raster cell's own point would collapse the pattern onto the regular grid.
  *
  * SDF usage (inside the lidar model; relative topics resolve against the
  * model's scoped topic, frame_id defaults to <parent>/<model>/lidar_3d):
@@ -53,6 +54,12 @@ namespace livox_laser_simulation_gz {
 struct ScanPoint {
     double azimuth;   // rad
     double zenith;    // rad (elevation, shifted by -pi/2 from CSV zenith degrees)
+};
+
+struct RayCell {
+    int idx;          // top-left raster cell, -1 if outside the raster FOV
+    float fu, fv;     // fractional offset towards the next column / row
+    float dx, dy, dz; // unit direction of the CSV ray
 };
 
 static bool LoadCsv(const std::string &path, std::vector<ScanPoint> &out) {
@@ -180,7 +187,7 @@ private:
             buildRasterMap(_msg);
             rasterReady_ = true;
         }
-        if (rasterIndices_.empty()) return;
+        if (rays_.empty()) return;
 
         int xOff = -1, yOff = -1, zOff = -1, iOff = -1;
         for (const auto &f : _msg.field()) {
@@ -192,8 +199,19 @@ private:
         if (xOff < 0 || yOff < 0 || zOff < 0) return;
 
         const int ps = _msg.point_step();
-        const int totalPix = _msg.width() * _msg.height();
+        const int w = _msg.width();
+        const int totalPix = w * _msg.height();
+        if (static_cast<int64_t>(_msg.data().size()) < static_cast<int64_t>(totalPix) * ps) return;
         const char *in = _msg.data().data();
+        auto range = [&](int idx, float &intensity) {
+            const char *pt = in + idx * ps;
+            float x, y, z;
+            std::memcpy(&x, pt + xOff, 4);
+            std::memcpy(&y, pt + yOff, 4);
+            std::memcpy(&z, pt + zOff, 4);
+            if (iOff >= 0) std::memcpy(&intensity, pt + iOff, 4);
+            return std::sqrt(x * x + y * y + z * z);
+        };
 
         gz::msgs::PointCloudPacked out;
         {
@@ -224,19 +242,25 @@ private:
 
         int64_t end = cursor_ + samplesPerFrame_;
         for (int64_t k = cursor_; k < end; k += downsample_) {
-            int64_t pi = k % static_cast<int64_t>(pattern_.size());
-            int idx = rasterIndices_[pi];
-            if (idx < 0 || idx >= totalPix) continue;
+            const RayCell &c = rays_[k % static_cast<int64_t>(pattern_.size())];
+            if (c.idx < 0 || c.idx + w + 1 >= totalPix) continue;
 
-            const char *pt = in + idx * ps;
-            float x, y, z, intensity = 1.0f;
-            std::memcpy(&x, pt + xOff, 4);
-            std::memcpy(&y, pt + yOff, 4);
-            std::memcpy(&z, pt + zOff, 4);
-            if (iOff >= 0) std::memcpy(&intensity, pt + iOff, 4);
-
-            float r = std::sqrt(x * x + y * y + z * z);
-            if (r < minRange_ || r > maxRange_) continue;
+            float i00 = 1.0f, i01 = 1.0f, i10 = 1.0f, i11 = 1.0f;
+            float r00 = range(c.idx, i00), r01 = range(c.idx + 1, i01);
+            float r10 = range(c.idx + w, i10), r11 = range(c.idx + w + 1, i11);
+            float rMin = std::min({r00, r01, r10, r11}), rMax = std::max({r00, r01, r10, r11});
+            float r, intensity;
+            if (std::isfinite(rMax) && rMax - rMin < 0.05f + 0.05f * rMin) {
+                r = (1 - c.fv) * ((1 - c.fu) * r00 + c.fu * r01) + c.fv * ((1 - c.fu) * r10 + c.fu * r11);
+                intensity = (1 - c.fv) * ((1 - c.fu) * i00 + c.fu * i01) + c.fv * ((1 - c.fu) * i10 + c.fu * i11);
+            } else {
+                // depth edge or miss: blending would invent points between surfaces
+                int du = c.fu < 0.5f ? 0 : 1, dv = c.fv < 0.5f ? 0 : 1;
+                r = dv ? (du ? r11 : r10) : (du ? r01 : r00);
+                intensity = dv ? (du ? i11 : i10) : (du ? i01 : i00);
+            }
+            if (!(r >= minRange_ && r <= maxRange_)) continue;
+            float x = r * c.dx, y = r * c.dy, z = r * c.dz;
 
             od.append(reinterpret_cast<const char*>(&x), 4);
             od.append(reinterpret_cast<const char*>(&y), 4);
@@ -268,24 +292,30 @@ private:
               << " mapped to FOV az=[" << hFovMin_*180/M_PI << "," << hFovMax_*180/M_PI
               << "] ze=[" << vFovMin_*180/M_PI << "," << vFovMax_*180/M_PI << "] deg\n";
 
-        rasterIndices_.resize(pattern_.size());
+        rays_.resize(pattern_.size());
         for (size_t i = 0; i < pattern_.size(); ++i) {
             double az = pattern_[i].azimuth;
             if (az > M_PI) az -= 2.0 * M_PI;
             double ze = pattern_[i].zenith;
+            RayCell &c = rays_[i];
             // CSV rays outside the raster FOV can't be sampled -> mark invalid.
             if (az < hFovMin_ || az > hFovMax_ || ze < vFovMin_ || ze > vFovMax_) {
-                rasterIndices_[i] = -1;
+                c.idx = -1;
                 continue;
             }
-            int col = std::clamp((int)((az - hFovMin_) / hR * (w - 1)), 0, w - 1);
-            int row = std::clamp((int)((ze - vFovMin_) / vR * (h - 1)), 0, h - 1);
-            rasterIndices_[i] = row * w + col;
+            double u = (az - hFovMin_) / hR * (w - 1), v = (ze - vFovMin_) / vR * (h - 1);
+            int col = std::clamp((int)u, 0, w - 2), row = std::clamp((int)v, 0, h - 2);
+            c.idx = row * w + col;
+            c.fu = std::clamp(u - col, 0.0, 1.0);
+            c.fv = std::clamp(v - row, 0.0, 1.0);
+            c.dx = std::cos(ze) * std::cos(az);
+            c.dy = std::cos(ze) * std::sin(az);
+            c.dz = std::sin(ze);
         }
     }
 
     std::vector<ScanPoint> pattern_;
-    std::vector<int> rasterIndices_;
+    std::vector<RayCell> rays_;
     bool rasterReady_ = false;
     int64_t cursor_ = 0;
     int samplesPerFrame_ = 24000;
