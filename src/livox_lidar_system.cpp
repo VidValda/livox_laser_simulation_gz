@@ -13,16 +13,16 @@
  * coverage, at GPU speed. A fine raster (e.g. 720x128) keeps the snap error
  * below the sensor's real angular resolution, so it does NOT look like stripes.
  *
- * SDF usage (world-level plugin):
+ * SDF usage (inside the lidar model; relative topics resolve against the
+ * model's scoped topic, frame_id defaults to <parent>/<model>/lidar_3d):
  *   <plugin filename="LivoxLidarSystem"
  *          name="livox_laser_simulation_gz::LivoxLidarSystem">
- *     <input_topic>world/grid_as2/model/drone0/model/lidar0/link/lidar_3d/sensor/gpu_ray/scan/points</input_topic>
+ *     <input_topic>link/lidar_3d/sensor/gpu_ray/scan/points</input_topic>
  *     <csv_file_name>mid360.csv</csv_file_name>
  *     <samples>24000</samples>
  *     <downsample>1</downsample>
  *     <update_rate>10</update_rate>
- *     <output_topic>livox/points</output_topic>
- *     <frame_id>livox_frame</frame_id>
+ *     <output_topic>lidar</output_topic>
  *     <min_range>0.1</min_range>
  *     <max_range>40.0</max_range>
  *   </plugin>
@@ -45,6 +45,7 @@
 #include <gz/sim/Entity.hh>
 #include <gz/sim/EntityComponentManager.hh>
 #include <gz/sim/EventManager.hh>
+#include <gz/sim/Util.hh>
 #include <gz/transport/Node.hh>
 
 namespace livox_laser_simulation_gz {
@@ -83,7 +84,7 @@ class LivoxLidarSystem :
     public gz::sim::ISystemPostUpdate
 {
 public:
-    void Configure(const gz::sim::Entity & /*_entity*/,
+    void Configure(const gz::sim::Entity &_entity,
                    const std::shared_ptr<const sdf::Element> &_sdf,
                    gz::sim::EntityComponentManager & /*_ecm*/,
                    gz::sim::EventManager & /*_eventMgr*/) override
@@ -113,12 +114,11 @@ public:
         if (sdf->HasElement("v_fov_min")) vFovMin_ = sdf->Get<double>("v_fov_min");
         if (sdf->HasElement("v_fov_max")) vFovMax_ = sdf->Get<double>("v_fov_max");
 
-        std::string outputTopic = "livox/points";
+        entity_ = _entity;
         if (sdf->HasElement("output_topic"))
-            outputTopic = sdf->Get<std::string>("output_topic");
-        std::string inputTopic;
+            outputTopic_ = sdf->Get<std::string>("output_topic");
         if (sdf->HasElement("input_topic"))
-            inputTopic = sdf->Get<std::string>("input_topic");
+            inputTopic_ = sdf->Get<std::string>("input_topic");
 
         if (!LoadCsv(csvFile, pattern_)) {
             if (auto *e = std::getenv("AMENT_PREFIX_PATH")) {
@@ -138,25 +138,34 @@ public:
               << " scan points from " << csvFile
               << ", samples/frame=" << samplesPerFrame_
               << ", downsample=" << downsample_ << "\n";
-
-        pub_ = node_.Advertise<gz::msgs::PointCloudPacked>(outputTopic);
-        if (!inputTopic.empty()) {
-            node_.Subscribe(inputTopic, &LivoxLidarSystem::OnCloud, this);
-            gzmsg << "[LivoxLidarSystem] Subscribing to " << inputTopic << "\n";
-        } else {
-            gzerr << "[LivoxLidarSystem] No <input_topic> set\n";
-        }
     }
 
     void PostUpdate(const gz::sim::UpdateInfo &_info,
-                    const gz::sim::EntityComponentManager & /*_ecm*/) override
+                    const gz::sim::EntityComponentManager &_ecm) override
     {
+        if (!connected_ && !pattern_.empty()) connect(_ecm);
         if (_info.paused) return;
         std::lock_guard<std::mutex> lk(mutex_);
         simTime_ = _info.simTime;
     }
 
 private:
+    // Deferred to the first update: a spawned model is configured before it is attached to the world.
+    void connect(const gz::sim::EntityComponentManager &_ecm)
+    {
+        const std::string scope = gz::sim::topicFromScopedName(entity_, _ecm, false);
+        auto resolve = [&](const std::string &t) { return !t.empty() && t[0] == '/' ? t : scope + "/" + t; };
+        if (frameId_.empty())
+            frameId_ = gz::sim::removeParentScope(
+                gz::sim::scopedName(entity_, _ecm, "/", false), "/") + "/lidar_3d";
+        const std::string in = resolve(inputTopic_), out = resolve(outputTopic_);
+        pub_ = node_.Advertise<gz::msgs::PointCloudPacked>(out);
+        node_.Subscribe(in, &LivoxLidarSystem::OnCloud, this);
+        connected_ = true;
+        gzmsg << "[LivoxLidarSystem] Subscribing to " << in
+              << ", publishing " << out << " in " << frameId_ << "\n";
+    }
+
     void OnCloud(const gz::msgs::PointCloudPacked &_msg)
     {
         // Rate-limit output to the configured update_rate (wall clock).
@@ -287,7 +296,11 @@ private:
     // Mid-360 vertical FOV: -7.2 deg (-0.126 rad) .. +52.2 deg (+0.911 rad).
     double hFovMin_ = -M_PI, hFovMax_ = M_PI;
     double vFovMin_ = -0.126, vFovMax_ = 0.911;
-    std::string frameId_ = "livox_frame";
+    std::string frameId_;
+    std::string inputTopic_ = "link/lidar_3d/sensor/gpu_ray/scan/points";
+    std::string outputTopic_ = "lidar";
+    gz::sim::Entity entity_ = gz::sim::kNullEntity;
+    bool connected_ = false;
 
     std::mutex mutex_;
     std::chrono::steady_clock::duration simTime_{0};
